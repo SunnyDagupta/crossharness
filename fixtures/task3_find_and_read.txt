@@ -1,0 +1,14 @@
+# Task: "Find the markdown file in docs/ and read its contents"
+# Recorded Hermes-format output. Generic surface again (list_directory /
+# read_file), plus double-encoded arguments on the second call -- an
+# OpenAI-dialect habit (arguments as a JSON string) bleeding into Hermes
+# output. The encoding layer must tolerate it.
+I'll list the docs directory first to find the markdown file.
+<tool_call>
+{"name": "list_directory", "arguments": {"path": "docs"}}
+</tool_call>
+---TURN---
+Found notes.md. Reading it now.
+<tool_call>
+{"name": "read_file", "arguments": "{\"path\": \"docs/notes.md\"}"}
+</tool_call>

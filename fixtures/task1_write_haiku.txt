@@ -1,0 +1,9 @@
+# Task: "Write a haiku about translation to haiku.txt"
+# Recorded Hermes-format output. NOTE: this model adhered to the advertised
+# harness surface (Write / file_path) but emitted its trained WIRE FORMAT
+# (in-band <tool_call> tags). Format-fluency and surface-fluency are
+# separate failures; this fixture exhibits only the first.
+I'll write the haiku to haiku.txt now.
+<tool_call>
+{"name": "Write", "arguments": {"file_path": "haiku.txt", "content": "one tongue to another\nthe call crosses the border\nsame hand, different glove"}}
+</tool_call>
