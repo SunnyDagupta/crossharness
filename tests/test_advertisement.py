@@ -19,7 +19,7 @@ from phase2a.advertisement import (
 )
 from phase2a.tasks import SYSTEM_PROMPT
 from eval_live import classify_call, _call_classes
-from analyze import aggregate, rule_of_three, two_proportion_se
+from analyze import aggregate, rule_of_three, two_proportion_se, turns_to_first_native, turns_to_success, median
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +213,91 @@ def test_call_classes_helper_normalizes():
     row_dict = {"calls": [{"class": "harness_native", "turn": 1}, {"class": "mappable_generic", "turn": 2}]}
     assert _call_classes(row_str) == ["harness_native", "mappable_generic"]
     assert _call_classes(row_dict) == ["harness_native", "mappable_generic"]
+
+
+# ---------------------------------------------------------------------------
+# Efficiency helpers
+# ---------------------------------------------------------------------------
+
+def test_turns_to_first_native_found():
+    row = {"calls": [
+        {"class": "mappable_generic", "turn": 1},
+        {"class": "harness_native", "turn": 2},
+    ], "passed": True, "turns": 2}
+    assert turns_to_first_native(row) == 2
+
+
+def test_turns_to_first_native_not_found():
+    row = {"calls": [{"class": "mappable_generic", "turn": 1}], "passed": False, "turns": 1}
+    assert turns_to_first_native(row) is None
+
+
+def test_turns_to_first_native_empty():
+    assert turns_to_first_native({"calls": []}) is None
+
+
+def test_turns_to_success_passed():
+    assert turns_to_success({"passed": True, "turns": 3}) == 3
+
+
+def test_turns_to_success_failed():
+    assert turns_to_success({"passed": False, "turns": 3}) is None
+
+
+def test_median_odd():
+    assert median([3, 1, 2]) == 2
+
+
+def test_median_even():
+    assert median([1, 2, 3, 4]) == 2.5
+
+
+def test_median_empty():
+    import math
+    assert math.isnan(median([]))
+
+
+def test_aggregate_efficiency_metrics():
+    rows = [
+        _make_row("full", True, [
+            {"class": "mappable_generic", "turn": 1},
+            {"class": "harness_native", "turn": 2},
+        ]),
+        _make_row("full", False, [
+            {"class": "harness_native", "turn": 1},
+        ]),
+        _make_row("syntactic", True, [{"class": "harness_native", "turn": 3}]),
+        _make_row("none", False, []),
+    ]
+    agg = aggregate(rows)
+
+    # full: native at turns 2 and 1 → median 1.5
+    assert agg["full"]["n_rows_with_native"] == 2
+    assert agg["full"]["median_turns_to_first_native"] == 1.5
+    # full: 1 success at turn 1 (passed=True, turns=1 default in _make_row... wait)
+    # _make_row sets turns=2 by default; let's check
+    assert agg["full"]["n_rows_success"] == 1
+
+    # syntactic: native at turn 3 → median 3.0
+    assert agg["syntactic"]["median_turns_to_first_native"] == 3.0
+
+
+def test_conversation_field_in_smoke(tmp_path):
+    # Verify run_sample returns a conversation field
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from eval_live import run_sample, ScriptedClient
+    from phase2a.tasks import TASKS, SYSTEM_PROMPT
+    from phase2a.advertisement import ADVERTISED_TOOLS_FULL
+
+    task = next(t for t in TASKS if t.name == "e1_json_port")
+    row = run_sample(task, "full", ScriptedClient(), 6, "user", SYSTEM_PROMPT, ADVERTISED_TOOLS_FULL)
+    assert "conversation" in row
+    assert isinstance(row["conversation"], list)
+    assert all("turn" in e and "role" in e and "text" in e for e in row["conversation"])
+    # ScriptedClient emits 2 tool calls then prose — at least model turns recorded
+    model_turns = [e for e in row["conversation"] if e["role"] == "model"]
+    assert len(model_turns) >= 1
 
 
 # ---------------------------------------------------------------------------

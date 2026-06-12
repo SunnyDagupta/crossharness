@@ -185,6 +185,7 @@ def run_sample(
     ]
     transcript: "List[dict]" = []
     call_records: "List[Dict[str, Any]]" = []
+    conversation: "List[Dict[str, Any]]" = []  # full turn-by-turn text for analysis
     malformed_turns = 0
     turns_used = 0
 
@@ -192,6 +193,7 @@ def run_sample(
         turns_used += 1
         model_text = client.chat(messages)
         messages.append({"role": "assistant", "content": model_text})
+        conversation.append({"turn": turns_used, "role": "model", "text": model_text})
 
         if condition == "none":
             # Raw text to a structured harness: nothing is recognized.
@@ -225,6 +227,7 @@ def run_sample(
         transcript.append(results_message)
         response_text = shim.harness_to_model(results_message)
         messages.append({"role": tool_role, "content": response_text})
+        conversation.append({"turn": turns_used, "role": "tool", "text": response_text})
 
         if task.check(SANDBOX, transcript):
             break  # early success; do not burn turns
@@ -238,6 +241,7 @@ def run_sample(
         "turns": turns_used,
         "calls": call_records,
         "malformed_turns": malformed_turns,
+        "conversation": conversation,
     }
 
 

@@ -25,7 +25,7 @@ import json
 import math
 import sys
 from collections import Counter, defaultdict
-from typing import List
+from typing import List, Optional
 
 
 def load_rows(paths: List[str]) -> List[dict]:
@@ -64,12 +64,37 @@ def rule_of_three(n: int) -> float:
 def _call_records(row: dict) -> List[dict]:
     """Normalize old list[str] and new list[dict] call formats to list[dict]."""
     out = []
-    for i, c in enumerate(row.get("calls", [])):
+    for c in row.get("calls", []):
         if isinstance(c, str):
             out.append({"class": c, "turn": 1})
         else:
             out.append(c)
     return out
+
+
+def turns_to_first_native(row: dict) -> "Optional[int]":
+    """Turn number of the first harness_native call, or None if none occurred."""
+    for rec in _call_records(row):
+        if rec["class"] == "harness_native":
+            return rec["turn"]
+    return None
+
+
+def turns_to_success(row: dict) -> "Optional[int]":
+    """Turns used when the task passed, else None."""
+    if not row.get("passed"):
+        return None
+    t = row.get("turns")
+    return t if t is not None else None
+
+
+def median(values: List[float]) -> float:
+    if not values:
+        return float("nan")
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
 
 
 def aggregate(rows: List[dict]) -> dict:
@@ -119,6 +144,10 @@ def aggregate(rows: List[dict]) -> dict:
         pc_total = len(post_calls)
         pc_deviation = sum(1 for c in post_calls if c not in ("harness_native", "advertised_distractor"))
 
+        # efficiency: turns to first harness_native call and turns to success
+        native_turn_vals = [t for r in cond_rows for t in [turns_to_first_native(r)] if t is not None]
+        success_turn_vals = [t for r in cond_rows for t in [turns_to_success(r)] if t is not None]
+
         result[cond] = {
             "ok": ok, "n": n, "p": p,
             "calls_total": total_calls,
@@ -131,6 +160,10 @@ def aggregate(rows: List[dict]) -> dict:
             "first_call_deviation": fc_deviation,
             "post_call_total": pc_total,
             "post_call_deviation": pc_deviation,
+            "median_turns_to_first_native": median(native_turn_vals),
+            "n_rows_with_native": len(native_turn_vals),
+            "median_turns_to_success": median(success_turn_vals),
+            "n_rows_success": len(success_turn_vals),
         }
 
     result["families"] = {
@@ -215,14 +248,18 @@ def render_markdown(agg: dict, paths: List[str], advertisement: str = "full") ->
         lines.append(f"| {cond} | {d['invoked']}/{d['n_invocable']} | {100*inv_p:.1f}% |")
     lines.append("")
 
-    lines.append("**Call classification (full condition)**\n")
+    lines.append("**Call classification — model emission (full condition)**\n")
+    lines.append("Call classes describe what names the model emitted, not execution outcome. "
+                 "Under the full condition, mappable_generic names are translated by the shim "
+                 "and executed; under syntactic, the same names are passed verbatim and rejected "
+                 "by the executor. The distinction is a pipeline property, not a model property.\n")
     fd = a["full"]
-    lines.append("| Bucket | Count |")
-    lines.append("|--------|-------|")
+    lines.append("| Emission class | Count |")
+    lines.append("|----------------|-------|")
     lines.append(f"| harness_native | {fd['calls_native']} |")
     if fd["calls_distractor"]:
-        lines.append(f"| advertised_distractor | {fd['calls_distractor']} (semantic confusion, out of shim scope) |")
-    lines.append(f"| deviation (mappable_generic + unmapped) | {fd['calls_deviation']} |")
+        lines.append(f"| advertised_distractor | {fd['calls_distractor']} (semantic confusion; out of shim scope) |")
+    lines.append(f"| mappable_generic + unmapped (deviation) | {fd['calls_deviation']} |")
     lines.append(f"| total | {fd['calls_total']} |")
     lines.append(f"\nDeviation upper 95% CI: ≤{100*full_upper:.1f}%")
     lines.append(f"Average calls/row under full: {calls_per_row:.2f}\n")
@@ -237,12 +274,28 @@ def render_markdown(agg: dict, paths: List[str], advertisement: str = "full") ->
                  f"{'—' if math.isnan(pc_rate) else f'{100*pc_rate:.1f}%'} |")
     lines.append("")
 
-    lines.append("**Syntactic condition call classification**\n")
-    lines.append("| Condition | Calls | harness_native | deviation | upper 95% CI |")
-    lines.append("|-----------|-------|----------------|-----------|--------------|")
+    lines.append("**Call classification — model emission (syntactic condition)**\n")
     sd = a["syntactic"]
-    lines.append(f"| syntactic | {sd['calls_total']} | {sd['calls_native']} "
-                 f"| {sd['calls_deviation']} | ≤{100*syn_upper:.1f}% |")
+    lines.append("| Emission class | Count | Upper 95% CI |")
+    lines.append("|----------------|-------|--------------|")
+    lines.append(f"| harness_native | {sd['calls_native']} | — |")
+    lines.append(f"| mappable_generic + unmapped (deviation) | {sd['calls_deviation']} | ≤{100*syn_upper:.1f}% |")
+    lines.append(f"| total | {sd['calls_total']} | |")
+    lines.append("")
+
+    lines.append("**Efficiency: turns to first harness_native call and turns to task success**\n")
+    lines.append("| Condition | Rows with any native call | Median turns-to-first-native | "
+                 "Rows succeeded | Median turns-to-success |")
+    lines.append("|-----------|--------------------------|------------------------------|"
+                 "----------------|------------------------|")
+    for cond in ("syntactic", "full"):
+        d = a[cond]
+        mtn = d["median_turns_to_first_native"]
+        mts = d["median_turns_to_success"]
+        mtn_str = f"{mtn:.1f}" if not math.isnan(mtn) else "—"
+        mts_str = f"{mts:.1f}" if not math.isnan(mts) else "—"
+        lines.append(f"| {cond} | {d['n_rows_with_native']}/{d['n']} | {mtn_str} | "
+                     f"{d['n_rows_success']}/{d['n']} | {mts_str} |")
     lines.append("")
 
     lines.append("**Success by family (full condition)**\n")
