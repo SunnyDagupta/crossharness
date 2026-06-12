@@ -11,7 +11,7 @@ from .shim import CallRecord, Shim
 from .surfaces import CLAUDE_CODE, HERMES_GENERIC, PROFILES, HarnessProfile, ToolSpec
 from .executor import SandboxExecutor
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "ParseError",

@@ -168,16 +168,82 @@ model-harness coupling is behavioral rather than notational, and
 training-time approaches are the only fix. The eval is informative in
 either direction.
 
+## Measured results (Phase 2a)
+
+**Run metadata**
+
+| Field | Value |
+|-------|-------|
+| Date | 2026-06-11 |
+| Model | hermes3:8b (Q4_0, 8.0B params, 131072-ctx) |
+| Serving | Ollama 0.30.6, localhost:11434 |
+| Harness | crossharness @ 8dc769d + stream:false patch (see eval_live.py) |
+| JSONL | data/hermes3-8b-q4-ollama-20260611.jsonl |
+| Rows | 360 (24 tasks × 3 conditions × 5 samples) |
+
+**Note:** The `none` condition is the definitional floor — without any
+translation the harness never receives a well-formed tool call, so 0% is
+by construction, not a model property.
+
+**Success rate per condition**
+
+| Condition | Success | Rate |
+|-----------|---------|------|
+| none | 0/120 | 0.0% |
+| syntactic | 32/120 | 26.7% |
+| full | 28/120 | 23.3% |
+
+Wire-format recovery (syntactic − none): **+26.7%** (SE 4.4%)
+Surface recovery (full − syntactic): **−3.3%** (SE 5.6%) — no detectable difference
+
+**Call classification**
+
+| Condition | Calls | harness_native | deviation | upper 95% CI |
+|-----------|-------|----------------|-----------|--------------|
+| syntactic | 77 | 77 | 0 | ≤3.9% |
+| full | 57 | 57 | 0 | ≤5.3% |
+
+Average calls/row under full: 0.47
+
+**Success by family (full condition)**
+
+| Family | none | syntactic | full |
+|--------|------|-----------|------|
+| E | 0/40 | 8/40 | 7/40 |
+| L | 0/25 | 4/25 | 1/25 |
+| M | 0/25 | 1/25 | 2/25 |
+| W | 0/30 | 19/30 | 18/30 |
+
+**Reading**
+
+Wire-format recovery is +26.7%: without the syntactic shim, hermes3:8b
+emits zero harness-compatible calls on every task. The shim's format
+translation alone recovers 26.7% of tasks. Surface deviation did not
+occur in this cell (0/57 calls used a generic surface, ≤5.3% upper 95%
+CI), so the full alias layer made no detectable difference (−3.3%, 0.6
+SE). The dominant residual failure is non-invocation (0.47 calls/row; W
+family ~60% vs M family ~8%): the model often produces no tool call at
+all, which is behavioral, not notational.
+
+**Scope limits:** one 8B model, Q4_0 quant, 3-tool clean catalog
+advertised in-prompt, Hermes-style prompt the model was trained on. The
+Phase 1 constructed fixtures exhibit a surface-deviation failure mode
+this live cell did not reproduce — whether that reflects the model
+class, the catalog size, or the advertisement condition is the next
+measurement axis.
+
 ## Roadmap
 
-- Phase 2a (machinery shipped, measurement pending): run the live suite
-  against open Hermes-format models; publish measured failure-mode
-  frequencies and recovery numbers
-- Phase 2b: OpenAI/Codex dialect encoding (arguments as JSON-encoded
-  strings, `tool_call_id` correlation); OpenClaw as a downstream target via
-  its ACP surface
-- Phase 2c: the recovery benchmark proper -- model x harness matrix, task
-  suite large enough to report points lost and points recovered with
+- Phase 2a (complete): hermes3:8b/Q4_0, wire-format recovery +26.7pp,
+  surface recovery not detectable (−3.3pp, 0.6 SE); data in data/
+- Phase 2a next axis: advertisement — larger and messier tool catalogs,
+  no in-prompt advertisement, non-Hermes-trained models; pending owner
+  decision (Phase 2b gated: <5pp surface recovery branch applies)
+- Phase 2b (gated, not started): OpenAI/Codex dialect encoding
+  (arguments as JSON-encoded strings, `tool_call_id` correlation);
+  OpenClaw as a downstream target via its ACP surface
+- Phase 2c: the recovery benchmark proper — model × harness matrix,
+  task suite large enough to report points lost and recovered with
   confidence intervals
 
 ## License
