@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 2a live runner: measure dialect failure modes on a real model.
 
-    export OPENROUTER_API_KEY=...          # or any OpenAI-compatible key
+    export OPENROUTER_API_KEY=...          # or any OpenAI-compatible endpoint
     python3 eval_live.py --model nousresearch/hermes-3-llama-3.1-8b
     python3 eval_live.py --smoke           # no network, validates pipeline
 
@@ -10,6 +10,19 @@ conditions (none / syntactic / full), classifies every emitted call, and
 reports the recovery decomposition defined in docs/phase2a-protocol.md.
 
 Stdlib only. Honors proxy environment variables via urllib defaults.
+
+Deployment notes
+----------------
+Ollama (tested 0.30.6): the /v1/chat/completions endpoint hangs
+indefinitely without ``"stream": false`` in the request body. This file
+always sends that flag. Switch to the native /api/chat endpoint if you
+prefer to drop the OpenAI-compat layer entirely.
+
+Ollama evicts models from memory after ~5 minutes of inactivity. The
+first request after eviction may need up to several minutes to reload
+the model. The client retries transport errors (TimeoutError, OSError)
+up to three times with 10/20 s backoff. For long runs, consider setting
+OLLAMA_KEEP_ALIVE=24h to prevent eviction between cells.
 """
 from __future__ import annotations
 
@@ -57,6 +70,7 @@ class OpenAICompatClient:
                 "messages": messages,
                 "temperature": self.temperature,
                 "max_tokens": 768,
+                "stream": False,
             }
         ).encode("utf-8")
         headers = {"Content-Type": "application/json"}
@@ -67,12 +81,17 @@ class OpenAICompatClient:
         )
         for attempt in range(3):
             try:
-                with urllib.request.urlopen(request, timeout=180) as response:
+                with urllib.request.urlopen(request, timeout=600) as response:
                     payload = json.loads(response.read().decode("utf-8"))
                 return payload["choices"][0]["message"]["content"] or ""
             except urllib.error.HTTPError as exc:
                 if exc.code in (429, 500, 502, 503) and attempt < 2:
                     time.sleep(2.0 * (attempt + 1))
+                    continue
+                raise
+            except (TimeoutError, OSError, urllib.error.URLError) as exc:
+                if attempt < 2:
+                    time.sleep(10.0 * (attempt + 1))
                     continue
                 raise
         return ""
