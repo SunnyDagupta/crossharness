@@ -3,7 +3,9 @@
 
     export OPENROUTER_API_KEY=...          # or any OpenAI-compatible endpoint
     python3 eval_live.py --model nousresearch/hermes-3-llama-3.1-8b
-    python3 eval_live.py --smoke           # no network, validates pipeline
+    python3 eval_live.py --advertisement none    # cell A: no tool advertisement
+    python3 eval_live.py --advertisement large   # cell B: 15-tool catalog
+    python3 eval_live.py --smoke                 # no network, validates pipeline
 
 Drives a live Hermes-format model through the 24-task suite under three
 conditions (none / syntactic / full), classifies every emitted call, and
@@ -19,10 +21,10 @@ always sends that flag. Switch to the native /api/chat endpoint if you
 prefer to drop the OpenAI-compat layer entirely.
 
 Ollama evicts models from memory after ~5 minutes of inactivity. The
-first request after eviction may need up to several minutes to reload
-the model. The client retries transport errors (TimeoutError, OSError)
-up to three times with 10/20 s backoff. For long runs, consider setting
-OLLAMA_KEEP_ALIVE=24h to prevent eviction between cells.
+client sends keep_alive=-1 for local endpoints so the model stays loaded
+between cells. Override with OLLAMA_KEEP_ALIVE env var or --no-keep-alive.
+The client retries transport errors (TimeoutError, OSError) up to three
+times with 10/20 s backoff.
 """
 from __future__ import annotations
 
@@ -42,6 +44,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from crossharness import CLAUDE_CODE, HERMES_GENERIC, ParseError, SandboxExecutor, Shim
 from crossharness.encodings import anthropic, hermes
 from phase2a.tasks import SYSTEM_PROMPT, TASKS, LiveTask
+from phase2a.advertisement import (
+    ADVERTISEMENT_PROMPTS,
+    ADVERTISEMENT_TOOL_SETS,
+    EXECUTOR_TOOLS,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SANDBOX = os.path.join(HERE, "sandbox_live")
@@ -57,22 +64,31 @@ CONDITIONS = ("none", "syntactic", "full")
 class OpenAICompatClient:
     """Minimal chat-completions client over urllib."""
 
-    def __init__(self, base_url: str, model: str, api_key: str, temperature: float):
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        api_key: str,
+        temperature: float,
+        keep_alive: "Optional[int]" = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.temperature = temperature
+        self.keep_alive = keep_alive
 
     def chat(self, messages: "List[dict]") -> str:
-        body = json.dumps(
-            {
-                "model": self.model,
-                "messages": messages,
-                "temperature": self.temperature,
-                "max_tokens": 768,
-                "stream": False,
-            }
-        ).encode("utf-8")
+        payload: "Dict[str, Any]" = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": 768,
+            "stream": False,
+        }
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
+        body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -124,9 +140,20 @@ class ScriptedClient:
 # Call classification
 # ---------------------------------------------------------------------------
 
-def classify_call(name: str) -> str:
+def classify_call(name: str, advertised_set: "frozenset[str]") -> str:
+    """Classify a single tool call by surface type.
+
+    Buckets (in priority order):
+      harness_native      -- name resolves on the Claude Code surface
+      advertised_distractor -- in advertised_set but not in the executor
+                              (semantic confusion; out of shim scope)
+      mappable_generic    -- name resolves via the generic Hermes profile
+      unmapped            -- no mapping found
+    """
     if CLAUDE_CODE.spec_for_surface(name) is not None:
         return "harness_native"
+    if name in advertised_set and name not in EXECUTOR_TOOLS:
+        return "advertised_distractor"
     if HERMES_GENERIC.spec_for_surface(name) is not None:
         return "mappable_generic"
     return "unmapped"
@@ -142,6 +169,8 @@ def run_sample(
     client,
     max_turns: int,
     tool_role: str,
+    system_prompt: str,
+    advertised_set: "frozenset[str]",
 ) -> "Dict[str, Any]":
     if os.path.isdir(SANDBOX):
         shutil.rmtree(SANDBOX)
@@ -151,11 +180,11 @@ def run_sample(
 
     shim = Shim(HERMES_GENERIC, CLAUDE_CODE, syntactic_only=(condition == "syntactic"))
     messages: "List[dict]" = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": task.prompt},
     ]
     transcript: "List[dict]" = []
-    call_classes: "List[str]" = []
+    call_records: "List[Dict[str, Any]]" = []
     malformed_turns = 0
     turns_used = 0
 
@@ -169,7 +198,10 @@ def run_sample(
             # Classification still runs so deviation is observable here too.
             try:
                 for call in hermes.parse_calls(model_text):
-                    call_classes.append(classify_call(call.name))
+                    call_records.append({
+                        "class": classify_call(call.name, advertised_set),
+                        "turn": turns_used,
+                    })
             except ParseError:
                 malformed_turns += 1
             break
@@ -184,7 +216,10 @@ def run_sample(
             break  # model emitted no tool call; it believes it is done
 
         for record in records:
-            call_classes.append(classify_call(record.model_call.name))
+            call_records.append({
+                "class": classify_call(record.model_call.name, advertised_set),
+                "turn": turns_used,
+            })
 
         results_message = executor.execute_message(harness_message)
         transcript.append(results_message)
@@ -201,7 +236,7 @@ def run_sample(
         "condition": condition,
         "passed": passed,
         "turns": turns_used,
-        "calls": call_classes,
+        "calls": call_records,
         "malformed_turns": malformed_turns,
     }
 
@@ -209,6 +244,14 @@ def run_sample(
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
+
+def _call_classes(row: dict) -> "List[str]":
+    """Normalize old list[str] and new list[dict] call formats."""
+    return [
+        c if isinstance(c, str) else c["class"]
+        for c in row.get("calls", [])
+    ]
+
 
 def aggregate(rows: "List[dict]") -> None:
     by_condition: "Dict[str, List[dict]]" = {c: [] for c in CONDITIONS}
@@ -227,14 +270,16 @@ def aggregate(rows: "List[dict]") -> None:
         rates[condition] = passed / len(cond_rows)
         print(f"{condition:<12} task success {passed}/{len(cond_rows)} ({rates[condition]:.0%})")
 
-    full_calls = [c for r in by_condition["full"] for c in r["calls"]]
+    full_calls = [c for r in by_condition["full"] for c in _call_classes(r)]
     if full_calls:
-        deviating = sum(1 for c in full_calls if c != "harness_native")
+        from collections import Counter
+        cc = Counter(full_calls)
+        deviating = sum(v for k, v in cc.items() if k != "harness_native")
         print()
         print(f"calls observed under full condition: {len(full_calls)}")
-        print(f"  harness_native:   {full_calls.count('harness_native')}")
-        print(f"  mappable_generic: {full_calls.count('mappable_generic')}")
-        print(f"  unmapped:         {full_calls.count('unmapped')}")
+        for bucket in ("harness_native", "mappable_generic", "advertised_distractor", "unmapped"):
+            if cc[bucket]:
+                print(f"  {bucket:<24} {cc[bucket]}")
         print(f"  deviation rate:   {deviating / len(full_calls):.0%}")
 
     if all(c in rates for c in CONDITIONS):
@@ -260,6 +305,10 @@ def main() -> None:
     parser.add_argument("--tasks", default="", help="comma-separated task name filter")
     parser.add_argument("--tool-role", choices=("user", "tool"), default="user",
                         help="chat role used to deliver tool responses (default: user, most provider-compatible)")
+    parser.add_argument("--advertisement", choices=("full", "none", "large"), default="full",
+                        help="tool advertisement cell: full (default), none, or large")
+    parser.add_argument("--no-keep-alive", action="store_true",
+                        help="disable keep_alive=-1 for local Ollama endpoints")
     parser.add_argument("--smoke", action="store_true", help="no-network pipeline validation")
     args = parser.parse_args()
 
@@ -269,14 +318,22 @@ def main() -> None:
         wanted = {t.strip() for t in args.tasks.split(",")}
         tasks = [t for t in TASKS if t.name in wanted]
 
+    adv_prompt_override = ADVERTISEMENT_PROMPTS[args.advertisement]
+    system_prompt = adv_prompt_override if adv_prompt_override is not None else SYSTEM_PROMPT
+    advertised_set = ADVERTISEMENT_TOOL_SETS[args.advertisement]
+
     rows: "List[dict]" = []
 
     if args.smoke:
         task = next(t for t in TASKS if t.name == "e1_json_port")
-        row = run_sample(task, "full", ScriptedClient(), args.max_turns, args.tool_role)
+        row = run_sample(
+            task, "full", ScriptedClient(), args.max_turns, args.tool_role,
+            system_prompt, advertised_set,
+        )
         rows.append(row)
         print(json.dumps(row, indent=2))
-        ok = row["passed"] and row["calls"] == ["mappable_generic", "mappable_generic"]
+        smoke_classes = [c["class"] if isinstance(c, dict) else c for c in row["calls"]]
+        ok = row["passed"] and smoke_classes == ["mappable_generic", "mappable_generic"]
         print("smoke:", "PASS" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 
@@ -285,7 +342,19 @@ def main() -> None:
         print("No API key found (OPENROUTER_API_KEY / OPENAI_COMPAT_API_KEY).", file=sys.stderr)
         sys.exit(2)
 
-    client = OpenAICompatClient(args.base_url, args.model, api_key, args.temperature)
+    is_local = "localhost" in args.base_url or "127.0.0.1" in args.base_url
+    env_keep_alive = os.environ.get("OLLAMA_KEEP_ALIVE")
+    if args.no_keep_alive:
+        keep_alive: "Optional[int]" = None
+    elif env_keep_alive is not None:
+        keep_alive = int(env_keep_alive)
+    elif is_local:
+        keep_alive = -1
+    else:
+        keep_alive = None
+
+    client = OpenAICompatClient(args.base_url, args.model, api_key, args.temperature,
+                                keep_alive=keep_alive)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -297,8 +366,12 @@ def main() -> None:
         for task in tasks:
             for condition in conditions:
                 for _ in range(args.samples):
-                    row = run_sample(task, condition, client, args.max_turns, args.tool_role)
+                    row = run_sample(
+                        task, condition, client, args.max_turns, args.tool_role,
+                        system_prompt, advertised_set,
+                    )
                     row["model"] = args.model
+                    row["advertisement"] = args.advertisement
                     rows.append(row)
                     out.write(json.dumps(row) + "\n")
                     out.flush()
